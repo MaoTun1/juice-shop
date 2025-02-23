@@ -1,0 +1,97 @@
+name: Security Scans
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Build docker image
+        run: docker build . -t juice-shop:${{ github.sha }}
+  cs-scan:
+    name: Grype Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Scan
+        uses: anchore/scan-action@v6
+        with:
+          image: bkimminich/juice-shop
+          fail-build: false
+          output-format: sarif
+          output-file: grype-results.sarif  # Çıktıyı dosyaya kaydet
+      - name: Upload Sarif File
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: grype-results.sarif
+      - name: SBOM generate
+        uses: anchore/sbom-action@v0
+        with:
+          image: bkimminich/juice-shop
+          output-file: "sbom.spdx.json"
+          format: "spdx-json"
+  semgrep-scan:
+    name: Semgrep Scan
+    runs-on: ubuntu-latest
+   
+    container: returntocorp/semgrep
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Semgrep Scan
+        run: semgrep --config=auto --sarif --output=semgrep.sarif .
+        continue-on-error: true
+      - name: Upload Sarif File
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+   
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Scan GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+        continue-on-error: true
+        id: gitleaks-scan
+      - name: Upload Sarif File
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+  dast-scan:
+    name: DAST Scan
+    runs-on: ubuntu-latest
+    needs: build  # Build tamamlanmadan çalışmasın
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Nuclei - Vulnerability Scan
+        id: nuclei_scan
+        uses: projectdiscovery/nuclei-action@main
+        with:
+          target: https://demo.example.juice.shop/ #buraya folkladığınız reponun linkini ekleyin.
+      - name: Upload Nuclei Log
+        uses: actions/upload-artifact@v4  # Güncellenmiş v4 sürümü
+        with:
+          name: nuclei.log
+          path: nuclei.log
+      - name: Upload Sarif File
+        uses: github/codeql-action/upload-sarif@v3
+        if: steps.nuclei_scan.outputs.sarif_exists == 'true'
+        with:
+          sarif_file: nuclei.sarif
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
