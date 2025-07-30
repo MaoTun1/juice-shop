@@ -1,97 +1,119 @@
-name: Security Scans
+name: Universal Security Scan
 on:
   push:
-    branches:
-      - master
+    branches: [master]
   pull_request:
+  workflow_dispatch:
+permissions:
+  contents: write  # Pages yayını için
+  pull-requests: write  # PR'a yorum yazabilmek için
 jobs:
-  build:
-    name: Build
+  security-scan:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout source code
         uses: actions/checkout@v3
-      - name: Build docker image
-        run: docker build . -t juice-shop:${{ github.sha }}
-  cs-scan:
-    name: Grype Scan
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-      - name: Scan
-        uses: anchore/scan-action@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          image: bkimminich/juice-shop
-          fail-build: false
-          output-format: sarif
-          output-file: grype-results.sarif  # Çıktıyı dosyaya kaydet
-      - name: Upload Sarif File
-        uses: github/codeql-action/upload-sarif@v3
+          python-version: 3.11
+      #####################################################
+      ## SEMGREP
+      #####################################################
+      - name: Install Semgrep
+        run: pip install semgrep
+      - name: Run Semgrep
+        run: semgrep --config auto --quiet > semgrep-report.txt || true
+      #####################################################
+      ## GITLEAKS
+      #####################################################
+      - name: Install Gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks-linux-amd64 -o gitleaks
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/
+      - name: Run Gitleaks
+        run: |
+          git fetch --unshallow || true
+          gitleaks detect \
+          --report-format json \
+          --report-path gitleaks-report.json \
+          --redact \
+          --verbose \
+          || true
+      #####################################################
+      ## TRUFFLEHOG
+      #####################################################
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@main
         with:
-          sarif_file: grype-results.sarif
-      - name: SBOM generate
-        uses: anchore/sbom-action@v0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          output_format: json
+          output_file: trufflehog-report.json
+      #####################################################
+      ## TRIVY
+      #####################################################
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@master
         with:
-          image: bkimminich/juice-shop
-          output-file: "sbom.spdx.json"
-          format: "spdx-json"
-  semgrep-scan:
-    name: Semgrep Scan
-    runs-on: ubuntu-latest
-   
-    container: returntocorp/semgrep
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-      - name: Semgrep Scan
-        run: semgrep --config=auto --sarif --output=semgrep.sarif .
-        continue-on-error: true
-      - name: Upload Sarif File
-        uses: github/codeql-action/upload-sarif@v3
+          scan-type: fs
+          ignore-unfixed: true
+          format: table
+          output: trivy-report.txt
+      #####################################################
+      ## RAPOR .MD OLUŞTUR
+      #####################################################
+      - name: Generate Markdown Report
+        run: |
+          echo "# 🔐 Security Scan Report" > report.md
+          echo "## 🧠 Semgrep Findings" >> report.md
+          if [ -s semgrep-report.txt ]; then echo '```' >> report.md && cat semgrep-report.txt >> report.md && echo '```' >> report.md; else echo "No issues found ✅" >> report.md; fi
+          echo "## 🕵️‍♂️ Gitleaks Secrets" >> report.md
+          if [ -s gitleaks-report.json ]; then cat gitleaks-report.json | jq -r '.[] | "* " + .RuleID + " in `" + .File + "` at line " + (.StartLine | tostring)' >> report.md; else echo "No secrets found ✅" >> report.md; fi
+          echo "## 🔍 TruffleHog History" >> report.md
+          if [ -s trufflehog-report.json ]; then cat trufflehog-report.json | jq -r '.results[]?.StringsFound[]? | "* Secret in `" + .SourceMetadata.Data + "`"' >> report.md; else echo "No history secrets found ✅" >> report.md; fi
+          echo "## 📦 Trivy Dependency Scan" >> report.md
+          if [ -s trivy-report.txt ]; then echo '```' >> report.md && cat trivy-report.txt >> report.md && echo '```' >> report.md; else echo "No vulnerabilities found ✅" >> report.md; fi
+      #####################################################
+      ## HTML YAYINI İÇİN RAPORU KOPYALA
+      #####################################################
+      - name: Convert Markdown to HTML
+        run: |
+          mkdir -p public
+          sudo apt update
+          sudo apt install -y pandoc
+          mkdir -p public
+          pandoc report.md -o public/index.html
+      - name: Upload HTML to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          sarif_file: semgrep.sarif
-  secret-scan:
-    name: Secret Scan
-    runs-on: ubuntu-latest
-   
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-      - name: Scan GitLeaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
-        continue-on-error: true
-        id: gitleaks-scan
-      - name: Upload Sarif File
-        uses: github/codeql-action/upload-sarif@v3
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+      #####################################################
+      ## ARTIFACT YÜKLEME
+      #####################################################
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: results.sarif
-  dast-scan:
-    name: DAST Scan
-    runs-on: ubuntu-latest
-    needs: build  # Build tamamlanmadan çalışmasın
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-      - name: Nuclei - Vulnerability Scan
-        id: nuclei_scan
-        uses: projectdiscovery/nuclei-action@main
+          name: security-scan-report
+          path: report.md
+      #####################################################
+      ## STEP SUMMARY (UI ÖZET)
+      #####################################################
+      - name: GitHub Summary UI
+        run: |
+          echo "### 🔐 Security Scan Completed" >> $GITHUB_STEP_SUMMARY
+          echo "- 📄 [Download report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- 🌐 [View full HTML report](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/)" >> $GITHUB_STEP_SUMMARY
+      #####################################################
+      ## PR'A YORUM BIRAK (SADELEŞTİRİLMİŞ)
+      #####################################################
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
         with:
-          target: https://demo.example.juice.shop/ #buraya folkladığınız reponun linkini ekleyin.
-      - name: Upload Nuclei Log
-        uses: actions/upload-artifact@v4  # Güncellenmiş v4 sürümü
-        with:
-          name: nuclei.log
-          path: nuclei.log
-      - name: Upload Sarif File
-        uses: github/codeql-action/upload-sarif@v3
-        if: steps.nuclei_scan.outputs.sarif_exists == 'true'
-        with:
-          sarif_file: nuclei.sarif
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          header: security-scan
+          message: |
+            ✅ **Security scan completed**
+            📄 [Markdown Report Artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            🌐 [HTML Report (GitHub Pages)](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/)
